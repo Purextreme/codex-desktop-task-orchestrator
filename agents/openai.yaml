@@ -1,0 +1,4 @@
+interface:
+  display_name: "Desktop Task Orchestrator"
+  short_description: "拆分任务到真实 Codex Desktop 对话，并行执行、跟踪依赖与整合结果"
+  default_prompt: "使用 $desktop-task-orchestrator 将当前工作拆分到真正的独立 Codex Desktop 对话，由当前对话总控、跟踪并整合结果。"

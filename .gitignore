@@ -1,0 +1,19 @@
+# Machine-local configuration and credentials
+.env
+.env.*
+!.env.example
+.codex/
+config.toml
+auth.json
+
+# Generated files and local test artifacts
+node_modules/
+__pycache__/
+.venv/
+outputs/
+logs/
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
