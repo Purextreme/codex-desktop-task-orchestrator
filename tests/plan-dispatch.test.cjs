@@ -14,7 +14,13 @@ const snapshot = (extra = {}) => ({schema_version: 1, workflow_id: 'fixture', ow
   generation: 1, phase: 'active', observed_at: new Date(NOW).toISOString(), total_limit: 4,
   worker_limit: 3, other_active: 0, monitor_active: false, control_health: 'ok',
   congestion: false, healthy_rounds: 0, tasks: [task('a'), task('b'), task('c'), task('d')], ...extra});
-const plan = state => planDispatch(state, caller, NOW);
+const healthy = (state, now = NOW) => ({schema_version: 1, workflow_id: state.workflow_id,
+  owner_thread_id: state.owner_thread_id, generation: state.generation, sampled_at: new Date(now).toISOString(),
+  scope: [...new Set([state.owner_thread_id, ...state.tasks.map(t => t.thread_id).filter(Boolean)])],
+  control: {status: 'ok'}, sources: {errors: []},
+  threads: [...new Set([state.owner_thread_id, ...state.tasks.map(t => t.thread_id).filter(Boolean)])]
+    .map(thread_id => ({thread_id, level: 'unknown', last_http_bytes: null}))});
+const plan = state => planDispatch(state, caller, NOW, healthy(state));
 
 test('bounded queue reserves one coordinator slot', () => {
   const result = plan(snapshot());
@@ -82,7 +88,7 @@ test('successor can dispatch only after ownership commit', () => {
   assert.deepEqual(planDispatch(state, successor, NOW).dispatch, []);
   Object.assign(state, {owner_thread_id: 'owner-b', generation: 2, phase: 'active'});
   assert.deepEqual(plan(state).dispatch, []);
-  assert.deepEqual(planDispatch(state, successor, NOW).dispatch, ['a', 'b', 'c']);
+  assert.deepEqual(planDispatch(state, successor, NOW, healthy(state)).dispatch, ['a', 'b', 'c']);
 });
 test('draining admits one read-only successor reservation but no business', () => {
   const state = snapshot({phase: 'draining'});
@@ -172,18 +178,79 @@ test('CLI reads only control JSON and preserves it, with media paths treated as 
     const input = JSON.stringify(snapshot({observed_at: new Date().toISOString(),
       selected_image: path.join(dir, 'never-created.png'), selected_video: path.join(dir, 'never-created.mp4')}));
     fs.writeFileSync(file, input, 'utf8');
+    fs.writeFileSync(path.join(dir, 'health.json'), JSON.stringify(healthy(JSON.parse(input), Date.now())), 'utf8');
     const cli = path.resolve(__dirname, '../scripts/plan-dispatch.cjs');
     const result = spawnSync(process.execPath, [cli, file, 'owner-a', '1'], {encoding: 'utf8'});
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).dispatch.length, 3);
     assert.equal(fs.readFileSync(file, 'utf8'), input);
-    assert.deepEqual(fs.readdirSync(dir), ['state.json']);
+    assert.deepEqual(fs.readdirSync(dir), ['health.json', 'state.json']);
     fs.writeFileSync(file, '{broken', 'utf8');
     assert.equal(spawnSync(process.execPath, [cli, file, 'owner-a', '1']).status, 1);
     fs.writeFileSync(file, ' '.repeat(262145), 'utf8');
     assert.equal(spawnSync(process.execPath, [cli, file, 'owner-a', '1']).status, 1);
   } finally {
     fs.rmSync(path.join(dir, 'state.json'), {force: true});
+    fs.rmSync(path.join(dir, 'health.json'), {force: true});
     fs.rmdirSync(dir);
   }
+});
+
+test('missing, stale, unrelated or blocked monitor holds all new work', () => {
+  const state = snapshot();
+  const good = healthy(state);
+  for (const bad of [null, {...good, sampled_at: new Date(NOW - 45001).toISOString()},
+    {...good, scope: ['another-owner']}, {...good, generation: 2},
+    {...good, control: {status: 'blocked'}}, {...good, sources: {errors: ['database_unavailable']}}]) {
+    const result = planDispatch(state, caller, NOW, bad);
+    assert.deepEqual(result.dispatch, []);
+    assert.ok(result.holds.length);
+    assert.equal(result.handoff_allowed, false);
+  }
+});
+
+test('20 MB warns; 25 MB holds old context and allows safe parent handoff', () => {
+  const state = snapshot(), health = healthy(state);
+  Object.assign(health.threads[0], {level: 'warn', last_http_bytes: 20000000});
+  assert.equal(planDispatch(state, caller, NOW, health).dispatch.length, 3);
+  health.threads[0].last_http_bytes = 25000000;
+  assert.deepEqual(planDispatch(state, caller, NOW, health).dispatch, []);
+  state.phase = 'draining';
+  assert.equal(planDispatch(state, caller, NOW, health).handoff_allowed, true);
+  health.control.status = 'blocked';
+  assert.equal(planDispatch(state, caller, NOW, health).handoff_allowed, false);
+});
+
+test('critical child never passes admission by leaving the old thread id queued', () => {
+  const state = snapshot({tasks: [task('a', {thread_id: 'old'}), task('b')]});
+  const health = healthy(state);
+  Object.assign(health.threads.find(t => t.thread_id === 'old'), {level: 'handoff', last_http_bytes: 26000000});
+  const result = planDispatch(state, caller, NOW, health);
+  assert.deepEqual(result.dispatch, ['b']);
+  assert.equal(result.waiting[0].reason, 'payload_handoff_required');
+  assert.equal(result.handoffs[0].action, 'wait_for_safe_checkpoint');
+});
+
+test('handoffs share dependency, resource and capacity admission with ordinary jobs', () => {
+  const old = task('old', {thread_id: 'old-thread', state: 'done', continue_needed: true,
+    idle_confirmed_at: new Date(NOW).toISOString(), resources: ['app:blender'],
+    handoff: {goal: 'Continue', authorization: 'User authorized', constraints: [], next_steps: ['Edit'],
+      editable_sources: [], external_requests: [], selected_version: {status: 'selected', version: 'v1', path: 'C:/selected.png', basis: 'Selected'}}});
+  const conflict = task('conflict', {resources: ['app:blender']});
+  for (const tasks of [[old, conflict], [conflict, old]]) {
+    const state = snapshot({tasks}), health = healthy(state);
+    Object.assign(health.threads.find(t => t.thread_id === 'old-thread'), {level: 'handoff', last_http_bytes: 25000000});
+    const result = planDispatch(state, caller, NOW, health);
+    assert.equal(result.dispatch.length + result.handoffs.filter(h => h.can_create).length, 1);
+  }
+  const state = snapshot({tasks: [task('upstream', {state: 'running', idle_confirmed: false}),
+    {...old, depends_on: ['upstream']}, task('other')]});
+  const health = healthy(state);
+  Object.assign(health.threads.find(t => t.thread_id === 'old-thread'), {level: 'handoff', last_http_bytes: 25000000});
+  assert.equal(planDispatch(state, caller, NOW, health).handoffs[0].can_create, false);
+  state.tasks[0].state = 'done'; state.tasks[0].idle_confirmed = true;
+  state.worker_limit = 1;
+  const result = planDispatch(state, caller, NOW, health);
+  assert.equal(result.handoffs[0].can_create, true);
+  assert.deepEqual(result.dispatch, []);
 });

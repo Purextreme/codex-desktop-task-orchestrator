@@ -1,6 +1,6 @@
 # 调度、监测与恢复
 
-任务需要排队、长时间执行、独立监测或主对话接班时读取。本流程通过 Skill 和工具协作执行，不是常驻后台调度服务，也不能绕过账户限流。
+任务需要排队、长时间执行、独立监测或主对话接班时读取。本流程通过 Skill 和工具协作执行；本地进程只观测元数据，实际派发和交接由总控完成，不能绕过账户限流。
 
 ## 有界派发
 
@@ -55,6 +55,8 @@
 ```
 
 真实控制文件还应保留任务的 threadId/hostId、cursor、选定版本、授权依据、输出路径及请求 ID；检查器允许这些附加文本字段，但不验证其事实。`ready=true` 只能由总控在核实输入和授权后设置。接班沿用同一逻辑 task id，旧 threadId 作为历史字段保留，不能复制成第二条就绪任务。
+
+检查器同时读取同目录 `health.json`；必须先按 [本地监测](local-monitor.md) 采样或启动 watch。缺失、超过 45 秒、owner/generation/scope 不符或控制阻塞时不会派发。未检测到 HTTP 大小显示 unknown，不等于请求为零。监测进程不计入 `monitor_active`（该字段只表示占模型名额的监测对话）。`handoffs` 与普通 dispatch 共用本轮空位，执行前逐项预留，不将二者重复计数。
 
 任务 `state`：`queued / starting / running / compacting / waiting_external / waiting_user / done / failed / unknown / superseded`。它们是本 Skill 的归一化状态，不是 Codex 工具原生枚举；根据最新工具结果映射，无法判断用 `unknown`。`external_state`：`none / pending / unknown / settled`。`idle_confirmed` 是最近一次实际观测，无反馈不算空闲；从未创建的排队任务可标记 true。`queued` 不得同时存在活动轮次或未决外部请求。失败或完成但外部结果未知，仍占名额或资源。
 

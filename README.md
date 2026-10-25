@@ -11,7 +11,8 @@
 - 新阶段创建全新对话，只交接选定版本和仍有效的要求。同阶段历史过大也可在安全点换新；主对话通过“准备、接收确认、提交派发权”移交给新主对话，保留旧入口，防止重复工作。
 - 区分执行完成、子对话验证、用户确认和自动推进授权，防止误用旧版本或重复提交状态未知的生成请求。
 - 需要继续的空闲子对话可按需 compact，已经不再使用的会话无需额外压缩。主对话不能用空闲适配器压缩正在执行的自己。
-- 默认主对话监测；可选独立监测对话只读观察和报告，由唯一总控执行恢复。离开当前回合后的持续监测需要另外创建并验证 heartbeat 自动化。
+- 使用轻量本地监测：未压缩 HTTP 请求体达到 20MB 提醒、25MB 在安全节点换新，仅携带选定版本和必要状态；选版不明确才询问用户。控制请求阻塞或观测失效时暂停新增，已有任务继续运行。
+- 本地进程每 15 秒读取增量元数据，不占模型名额；总控负责交接和恢复。它不读取媒体、不删文件、不修改聊天数据库。回合结束后可继续写状态，但不会主动唤醒模型或通知用户；未来主动跟进需要另行安排 heartbeat。
 
 这套流程减少历史媒体在后续请求中的累积，不保证消除网络延迟、服务端排队或桌面内部阻塞。已有的图片不会因为提示词要求“忽略”就从上下文卸载。
 
@@ -61,6 +62,9 @@ node ./scripts/compact-thread.cjs --thread-id <真实聊天UUID> --idle-confirme
 - `agents/openai.yaml`：Skill 界面元数据。
 - `scripts/compact-thread.cjs`：可选的 Windows compact MCP / CLI 适配器。
 - `scripts/plan-dispatch.cjs`：无依赖的只读派发检查器，校验所有权、快照新鲜度、活动名额、依赖和资源占用，输出候选及异常，不执行任务。
+- `scripts/local-monitor.py`、`scripts/start-monitor.ps1`：Python 标准库元数据监测与 Windows 隐藏进程启动器；每个工作目录单写者、原子状态输出、默认 8 小时退出。
+- `scripts/monitor-policy.cjs`：health 校验及选定版本交接策略，不执行媒体读取或聊天创建。
+- `references/local-monitor.md`：启动、停止、20/25MB 规则、阻塞恢复和观测限制。
 - `references/session-lifecycle.md`：选择 compact 或换新，最小交接包与主对话接班协议。
 - `references/scheduling-and-monitoring.md`：就绪队列、状态格式、退避、恢复与可选监测。
 - `tests/plan-dispatch.test.cjs`：离线模拟队列、移交、拥堵及异常的测试。
@@ -68,10 +72,12 @@ node ./scripts/compact-thread.cjs --thread-id <真实聊天UUID> --idle-confirme
 长流程使用项目中的 `.orchestrator/<工作标识>/state.json` 保留当前状态，只有当前总控写入。根据最新工具结果刷新后运行：
 
 ```text
+python scripts/local-monitor.py --state <state.json>
 node scripts/plan-dispatch.cjs <state.json> <当前总控threadId> <generation>
-node --test tests/plan-dispatch.test.cjs
+node --test tests/plan-dispatch.test.cjs tests/monitor-policy.test.cjs
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-检查器不连接 Desktop、不调用模型、不读取媒体；不是跨所有主对话的硬锁或后台服务。详细状态例子和执行前的核对要求见调度文档。并发数或检测阈值应随实际证据调整，不能用无进展计时器直接杀任务或重发付费请求。
+派发检查器不连接 Desktop、不调用模型、不读取媒体；它读取新鲜的本地 health，缺失时停止新增。长流程按本地监测文档启动 watch，不要每次重新扫描。HTTP 大小字段无法覆盖所有 WebSocket 请求，日志缓冲也可能延后发现；这不是发送前硬拦截或跨所有手工聊天的全局锁。阈值是工作流经验值，不是官方限制。不能用无进展计时器直接杀任务或重发付费请求。
 
 发布前已检查 Skill 格式、Node.js 语法和 MCP 初始化、工具发现及无效参数拒绝行为。真实桌面交接与 compact 曾在本地环境验证；不代表所有版本和账号环境均兼容。仓库不包含用户素材、聊天记录、本机配置、凭据或运行日志。

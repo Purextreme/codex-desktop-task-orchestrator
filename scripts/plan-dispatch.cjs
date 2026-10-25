@@ -1,6 +1,8 @@
 'use strict';
 // Read-only admission advisor. No Codex IPC, network, media reads or task execution.
 const fs = require('node:fs');
+const path = require('node:path');
+const {monitorGate, handoffDecision} = require('./monitor-policy.cjs');
 
 const STATES = new Set(['queued', 'starting', 'running', 'compacting', 'waiting_external',
   'waiting_user', 'done', 'failed', 'unknown', 'superseded']);
@@ -30,7 +32,7 @@ function occupies(task) {
   return task.state !== 'queued' && (!task.idle_confirmed || ACTIVE.has(task.state) || task.external_state === 'unknown');
 }
 
-function planDispatch(state, caller, now = Date.now()) {
+function planDispatch(state, caller, now = Date.now(), health = null) {
   check(state && state.schema_version === 1, 'Unsupported schema_version');
   string(state.workflow_id, 'workflow_id');
   string(state.owner_thread_id, 'owner_thread_id');
@@ -93,6 +95,10 @@ function planDispatch(state, caller, now = Date.now()) {
   if (now - observed > 120000 || observed - now > 5000) holds.push('snapshot_stale_or_clock_skew');
   if (state.control_health !== 'ok') holds.push('control_unhealthy');
   if (state.congestion) holds.push('congestion_backoff');
+  const monitor = monitorGate(state, health, now);
+  holds.push(...monitor.holds);
+  const ownerNeedsHandoff = monitor.threads.get(state.owner_thread_id)?.level === 'handoff';
+  if (ownerNeedsHandoff && state.phase === 'active') holds.push('owner_payload_handoff');
 
   const workers = state.tasks.filter(occupies).length;
   const occupancy = 1 + Number(state.monitor_active) + state.other_active + workers;
@@ -112,9 +118,26 @@ function planDispatch(state, caller, now = Date.now()) {
   const reserved = new Set(state.tasks
     .filter(task => task.state !== 'queued' && !safeTerminal(task))
     .flatMap(task => task.resources));
-  const dispatch = [], waiting = [], alerts = [];
+  const dispatch = [], waiting = [], alerts = [...monitor.alerts], handoffs = [];
+  let handoffSlots = 0;
+  const plannedResources = new Set();
 
   for (const task of state.tasks) {
+    const needsHandoff = monitor.threads.get(task.thread_id)?.level === 'handoff';
+    if (needsHandoff) {
+      const decision = handoffDecision(task, now);
+      const conflict = state.tasks.some(other => other !== task && other.state !== 'queued'
+        && !safeTerminal(other) && other.resources.some(resource => task.resources.includes(resource)))
+        || task.resources.some(resource => plannedResources.has(resource));
+      decision.can_create = decision.action === 'ready_for_fresh_chat' && !holds.length
+        && task.depends_on.every(id => ids.get(id).state === 'done' && safeTerminal(ids.get(id)))
+        && !conflict && dispatch.length + handoffSlots < slots;
+      if (decision.can_create) {
+        handoffSlots++;
+        for (const resource of task.resources) { reserved.add(resource); plannedResources.add(resource); }
+      }
+      handoffs.push(decision);
+    }
     if (task.state === 'unknown' || task.external_state === 'unknown') {
       alerts.push({id: task.id, reason: 'outcome_unknown', action: 'inspect_original_request'});
     } else if (task.state === 'waiting_user') {
@@ -129,15 +152,16 @@ function planDispatch(state, caller, now = Date.now()) {
     }
     if (task.state !== 'queued') continue;
     let reason;
-    if (!task.ready) reason = 'input_or_authorization_unverified';
+    if (needsHandoff) reason = 'payload_handoff_required';
+    else if (!task.ready) reason = 'input_or_authorization_unverified';
     else if (!task.depends_on.every(id => ids.get(id).state === 'done' && safeTerminal(ids.get(id)))) reason = 'dependency';
     else if (task.resources.some(resource => reserved.has(resource))) reason = 'resource_busy';
     else if (holds.length) reason = 'dispatch_held';
-    else if (dispatch.length >= slots) reason = 'capacity';
+    else if (dispatch.length + handoffSlots >= slots) reason = 'capacity';
     if (reason) waiting.push({id: task.id, reason});
     else {
       dispatch.push(task.id);
-      for (const resource of task.resources) reserved.add(resource);
+      for (const resource of task.resources) { reserved.add(resource); plannedResources.add(resource); }
     }
   }
   let nextLimit = state.worker_limit;
@@ -147,7 +171,8 @@ function planDispatch(state, caller, now = Date.now()) {
     occupancy, active_workers: workers, available_slots: holds.length ? 0 : slots,
     handoff_allowed: handoffAllowed,
     handoff_recheck: handoffRecheck,
-    next_worker_limit: nextLimit, dispatch, waiting, alerts};
+    next_worker_limit: nextLimit, dispatch, waiting, alerts, handoffs,
+    owner_needs_handoff: ownerNeedsHandoff};
 }
 
 if (require.main === module) {
@@ -157,7 +182,13 @@ if (require.main === module) {
       'Usage: node plan-dispatch.cjs <state.json> <caller-thread-id> <generation>');
     check(fs.statSync(file).size <= 262144, 'Control file exceeds 256 KiB; retain current state only');
     const state = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
-    const plan = planDispatch(state, {thread_id: owner, generation: Number(generation)});
+    let health = null;
+    try {
+      const healthFile = path.join(path.dirname(file), 'health.json');
+      check(fs.statSync(healthFile).size <= 262144, 'Monitor file exceeds 256 KiB');
+      health = JSON.parse(fs.readFileSync(healthFile, 'utf8').replace(/^\uFEFF/, ''));
+    } catch { /* Missing, damaged or stale telemetry fails closed in monitorGate. */ }
+    const plan = planDispatch(state, {thread_id: owner, generation: Number(generation)}, Date.now(), health);
     process.stdout.write(JSON.stringify(plan, null, 2) + '\n');
   } catch (error) {
     process.stderr.write(`No dispatch: ${error.message}\n`);
