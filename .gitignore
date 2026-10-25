@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .codex/
+.orchestrator/
 config.toml
 auth.json
 
